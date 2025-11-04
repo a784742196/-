@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>⚡ 中文无KYC 8家比价神器 · V8.1 改进版</title>
+<style>
+  body{font:20px system-ui;background:#000;color:#0f0;text-align:center;padding:20px;word-break:break-word}
+  input,button{margin:10px;padding:15px;font-size:20px;width:90%;border:2px solid #0f0;background:#000;color:#0f0;border-radius:12px}
+  .r{padding:15px;background:#111;border:1px solid #0f0;border-radius:12px;margin:10px;font-family:monospace;font-size:18px}
+  .best{color:#ff0;font-size:22px;font-weight:bold}
+  a{color:#0f0;text-decoration:underline}
+  .loading{color:#0ff;}
+</style>
+</head>
+<body>
+<h1>⚡ 中文 8 家无 KYC 比价神器 · V8.1 改进增强版</h1>
+从：<input list="fl" id="f" placeholder="btc / doge / sol"><br>
+到：<input list="tl" id="t" placeholder="eth / usdt / bnb"><br>
+金额：<input id="a" type="number" value="1" min="0" step="any"><br>
+<button onclick="go()">⚡ 开始比价（8家并行）</button>
+<div id="o" class="loading">正在加载 3500+ 币种中，请稍候…</div>
+<datalist id="fl"></datalist>
+<datalist id="tl"></datalist>
+
+<script>
+// ================== 改进版代理配置 ==================
+const proxyList = [
+  "https://corsproxy.io/?{url}",
+  "https://corsproxy.org/?{url}",
+  "https://api.allorigins.win/raw?url={url}"
+];
+
+// ================== 工具函数 ==================
+function getProxy(isPost = false, excludeProxy = "") {
+  let availableProxies = proxyList.filter(p => p !== excludeProxy);
+  if (isPost) availableProxies = availableProxies.filter(p => !p.includes("allorigins"));
+  return availableProxies.length ? availableProxies[Math.floor(Math.random() * availableProxies.length)] : "";
+}
+
+function fetchWithTimeout(resource, options = {}, timeout = 7000) {
+  return Promise.race([
+    fetch(resource, options),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), timeout))
+  ]).catch(err => {
+    if (err.message === "timeout") console.warn("Timeout URL:", resource);
+    throw err;
+  });
+}
+
+// ================== 改进版 fetchWithProxy ==================
+async function fetchWithProxy(urlNoProxy, options = {}, timeout = 7000, isPost = false, proxyPrimary = "") {
+  const primary = proxyPrimary || getProxy(isPost);
+  const tryProxies = [];
+
+  if (primary) tryProxies.push(primary);
+  const others = proxyList.filter(p => p !== primary);
+  const filteredOthers = isPost ? others.filter(p => !p.includes("allorigins")) : others;
+  filteredOthers.forEach(p => tryProxies.push(p));
+
+  let lastErr = null;
+  const encoded = encodeURIComponent(urlNoProxy);
+
+  for (let proxy of tryProxies) {
+    try {
+      if (!proxy) continue;
+      let full = proxy.includes("{url}") ? proxy.replace(/{url}/g, encoded)
+               : (proxy.endsWith("?") ? proxy + encoded
+               : (proxy.includes("?") ? proxy + "&url=" + encoded : proxy + "?url=" + encoded));
+      if (!full.startsWith("http")) throw new Error("invalid_proxy_url");
+      const res = await fetchWithTimeout(full, options, timeout);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res;
+    } catch (e) {
+      console.warn(`Proxy ${proxy} failed for ${urlNoProxy}:`, e);
+      lastErr = e;
+    }
+  }
+
+  // 最后尝试直接请求
+  try {
+    const res = await fetchWithTimeout(urlNoProxy, options, timeout);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res;
+  } catch (e) {
+    console.error("所有代理与直连均失败:", e);
+    throw lastErr || e;
+  }
+}
+
+// ================== API Keys（可选） ==================
+const changeNowKey = "";
+const stealthExKey = "";
+const letsExchangeKey = "";
+
+if (!changeNowKey) console.warn("⚠️ 建议配置 ChangeNOW API Key: https://changenow.io/developers");
+
+// ================== 构建代理缓存 ==================
+function buildProxyCache() {
+  return {
+    GET: getProxy(false),
+    POST: getProxy(true)
+  };
+}
+
+// ================== 各交易所配置 ==================
+function buildSites(proxyCache) {
+  const pGET = proxyCache.GET;
+  const pPOST = proxyCache.POST;
+
+  return {
+    "ChangeNOW": {
+      fn:()=>fetchWithProxy(`https://api.changenow.io/v2/exchange/amount/${a()}/${f()}_to_${t()}?api_key=${changeNowKey}`, {}, 7000, false, pGET)
+        .then(r=>r.json()).then(j=>parseFloat(j?.toAmount||0)),
+      link:()=>`https://changenow.io/?from=${f()}&to=${t()}&amount=${a()}`
+    },
+    "Exolix": {
+      fn:()=>fetchWithProxy(`https://api.exolix.com/v2/rate?from=${f().toUpperCase()}&to=${t().toUpperCase()}&amount=${a()}&rateType=all`, {}, 7000, false, pGET)
+        .then(r=>r.json()).then(j=>parseFloat(j?.result?.amount||j?.amount||j?.toAmount||0)),
+      link:()=>`https://exolix.com/exchange?from=${f()}&to=${t()}&amount=${a()}`
+    },
+    "SimpleSwap": {
+      fn:()=>fetchWithProxy(`https://api.simpleswap.io/get_estimated?fixed=false&currency_from=${f()}&currency_to=${t()}&amount=${a()}`, {}, 7000, false, pGET)
+        .then(r=>r.json()).then(j=>parseFloat(j?.estimated||j?.result||0)),
+      link:()=>`https://simpleswap.io/?from=${f()}&to=${t()}&amount=${a()}`
+    },
+    "StealthEX": {
+      fn:()=>fetchWithProxy(`https://api.stealthex.io/api/v2/estimate/${f()}/${t()}?amount=${a()}&fixed=false&api_key=${stealthExKey}`, {}, 7000, false, pGET)
+        .then(r=>r.json()).then(j=>parseFloat(j?.estimated_amount||0)),
+      link:()=>`https://stealthex.io/?from=${f()}&to=${t()}&amount=${a()}`
+    },
+    "SwapSpace": {
+      fn:()=>fetchWithProxy(`https://api.swapspace.co/api/v1/estimate`,
+        {method:"POST",headers:{"Content-Type":"application/json"},
+         body:JSON.stringify({from:f(),to:t(),amount:a()})},
+        7000,true,pPOST).then(r=>r.json()).then(j=>parseFloat(j?.best?.toAmount||0)),
+      link:()=>`https://swapspace.co/?from=${f()}&to=${t()}&amount=${a()}`
+    },
+    "Godex": {
+      fn:()=>fetchWithProxy(`https://api.godex.io/api/v1/info?from=${f().toUpperCase()}&to=${t().toUpperCase()}&amount=${a()}`, {}, 7000, false, pGET)
+        .then(r=>r.json()).then(j=>parseFloat(j?.amount||0)),
+      link:()=>`https://godex.io/?from=${f()}&to=${t()}&amount=${a()}`
+    },
+    "LetsExchange": {
+      fn:()=>fetchWithProxy(`https://api.letsexchange.io/api/v1/info`,
+        {method:"POST",headers:{"Content-Type":"application/json"},
+         body:JSON.stringify({from:f(),to:t(),amount:a(),api_key:letsExchangeKey})},
+        7000,true,pPOST).then(r=>r.json()).then(j=>parseFloat(j?.toAmount||0)),
+      link:()=>`https://letsexchange.io/?from=${f()}&to=${t()}&amount=${a()}`
+    },
+    "FixedFloat": {
+      fn:()=>fetchWithProxy(`https://ff.io/api/v2/price?from=${f().toUpperCase()}&to=${t().toUpperCase()}&amount=${a()}&type=float`, {}, 7000, false, pGET)
+        .then(r=>r.json()).then(j=>parseFloat((!j?.error && j?.to)? j.to : 0)),
+      link:()=>`https://ff.io/?from=${f()}&to=${t()}&amount=${a()}`
+    }
+  };
+}
+
+// ================== 币种加载 ==================
+function loadCurrencies() {
+  const primaryUrl = "https://api.swapspace.co/v1/currencies";
+  const fallbackUrl = "https://api.simpleswap.io/get_all_currencies";
+
+  fetch(primaryUrl)
+    .then(r=>r.json())
+    .then(d=>{
+      if (d && d.length) renderCurrencies(d);
+      else throw new Error("empty");
+    })
+    .catch(()=>{
+      fetch(fallbackUrl)
+        .then(r=>r.json())
+        .then(d=>{
+          const mapped = Object.keys(d||{}).map(k=>({ticker:k,name:d[k].name||k}));
+          renderCurrencies(mapped);
+        })
+        .catch(()=>{ document.getElementById("o").innerHTML="⚠️ 币种加载失败，请刷新重试。"; });
+    });
+}
+
+function renderCurrencies(data){
+  const h = data.map(c=>`<option value="${c.ticker.toLowerCase()}">${c.name}</option>`).join("");
+  document.getElementById("fl").innerHTML = document.getElementById("tl").innerHTML = h;
+  document.getElementById("o").innerHTML = "✅ 币种加载完成，输入简称即可自动补全。";
+}
+
+loadCurrencies();
+
+// ================== 输入函数 ==================
+let f=()=>document.getElementById("f").value.trim().toLowerCase();
+let t=()=>document.getElementById("t").value.trim().toLowerCase();
+let a=()=>Number(document.getElementById("a").value)||1;
+
+// ================== 主逻辑 ==================
+async function go(){
+  if(!f()||!t()) { alert("请填写币对（例如：从 btc 到 eth）"); return; }
+
+  document.getElementById("o").innerHTML="<div class='r loading'>正在同时查询 8 家汇率，请稍候…</div>";
+
+  const proxyCache = buildProxyCache();
+  const sitesObj = buildSites(proxyCache);
+
+  let html="", best=0, bestName="", bestLink="";
+  const results = await Promise.all(Object.entries(sitesObj).map(async([n,obj])=>{
+    try{
+      const r = await obj.fn();
+      if (isNaN(r) || r <= 0) throw new Error("invalid");
+      return {name:n,result:r,link:obj.link()};
+    }catch(e){
+      console.warn(`[${n}] 查询失败`, e);
+      return {name:n,result:"超时/失败"};
+    }
+  }));
+
+  results.sort((a,b)=>{
+    const aNum = typeof a.result === "number";
+    const bNum = typeof b.result === "number";
+    if (aNum && !bNum) return -1;
+    if (!aNum && bNum) return 1;
+    if (aNum && bNum) return b.result - a.result;
+    return 0;
+  });
+
+  for (const it of results) {
+    if (typeof it.result === "number") {
+      best = it.result; bestName = it.name; bestLink = it.link; break;
+    }
+  }
+
+  results.forEach(item=>{
+    if (typeof item.result === "number") {
+      const rVal = item.result.toFixed(6);
+      html += `<div class=r>${item.name}<br>→ ${rVal} ${t().toUpperCase()}<br><a href="${item.link}" target="_blank">去兑换</a></div>`;
+    } else {
+      html += `<div class=r>${item.name}<br>→ 超时或失败</div>`;
+    }
+  });
+
+  if (bestName) {
+    html = `<div class="r best">★ ${bestName} 汇率最佳！<br>汇率：${best.toFixed(6)} ${t().toUpperCase()}<br><a href="${bestLink}" target="_blank" style="font-size:28px">⚡ 立即跳转下单</a></div>` + html;
+  } else {
+    html = `<div class="r best">❌ 所有交易所查询失败或超时。</div>` + html;
+  }
+
+  html += `<br><button onclick="go()">🔄 重新查询</button>`;
+  document.getElementById("o").innerHTML = html;
+}
+</script>
+</body>
+</html>
