@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>即时兑换汇率对比（中文）</title>
+  <style>
+    body { font-family: -apple-system, "Helvetica Neue", Arial; margin: 12px; }
+    input, button, select { font-size: 16px; padding: 4px; border-radius: 4px; border: 1px solid #ccc; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { border-bottom: 1px solid #ddd; padding: 8px; text-align:left; }
+    .ok { color: green; } .err { color: #c00; }
+    .small { font-size: 13px; color: #666; }
+    .adapter-item { border: 1px solid #eee; padding: 8px; margin: 6px 0; border-radius: 4px; background: #f9f9f9; }
+    .section-title { margin-top: 20px; border-bottom: 2px solid #555; padding-bottom: 5px; }
+  </style>
+</head>
+<body>
+  <h2>🪙 即时兑换汇率对比</h2>
+  <div>
+    <label>币种From:<input id="from" value="BTC" style="width:80px"></label>
+    <label>币种To:<input id="to" value="USDT" style="width:80px"></label>
+    <button id="compare">一键比价</button>
+    <button id="addAdapter">新增交易所</button>
+    <button id="loadExample">载入示例</button>
+  </div>
+  <div class="small" style="margin-bottom: 10px;">适配器已自动保存在浏览器中。</div>
+  <div id="adapterList"></div>
+
+  <h3 class="section-title">📊 汇率结果</h3>
+  <div id="status" class="small">尚未查询</div>
+
+  <h4 style="color: #007bff;">浮动汇率对比</h4>
+  <table id="floatingTable"><thead><tr><th>交易所</th><th>汇率</th><th>操作</th></tr></thead><tbody></tbody></table>
+
+  <h4 style="color: #28a745;">锁定汇率对比</h4>
+  <table id="lockedTable"><thead><tr><th>交易所</th><th>汇率</th><th>操作</th></tr></thead><tbody></tbody></table>
+
+<script>
+const WORKER_URL = 'https://你的-worker子域.workers.dev';
+
+let adapters = JSON.parse(localStorage.getItem('adapters_v2') || '[]');
+function saveAdapters() { localStorage.setItem('adapters_v2', JSON.stringify(adapters)); }
+function escapeHtml(s){ return s? s.replace(/"/g,'&quot;').replace(/</g,'&lt;') : ''; }
+
+function renderAdapters() {
+  const container = document.getElementById('adapterList');
+  container.innerHTML = '';
+  adapters.forEach((a, i) => {
+    const div = document.createElement('div');
+    div.className = 'adapter-item';
+    div.innerHTML = `
+      <b>${a.name || ('适配器 ' + (i+1))}</b><br>
+      <div class="small">URL模板: <input data-i="${i}" class="url" value="${escapeHtml(a.urlTemplate||'')}" style="width:90%"></div>
+      <div class="small">链接模板: <input data-i="${i}" class="linkTemplate" value="${escapeHtml(a.linkTemplate||'')}" style="width:90%"></div>
+      <div class="small">
+        <label>类型: 
+          <select data-i="${i}" class="rateType">
+            <option value="floating" ${a.rateType==='floating'?'selected':''}>浮动</option>
+            <option value="locked" ${a.rateType==='locked'?'selected':''}>锁定</option>
+          </select>
+        </label>
+      </div>
+      <label>解析类型:
+        <select data-i="${i}" class="parseType">
+          <option value="json" ${a.parseType==='json'?'selected':''}>json</option>
+          <option value="html_regex" ${a.parseType==='html_regex'?'selected':''}>html_regex</option>
+        </select>
+      </label>
+      <label>路径/Regex: <input data-i="${i}" class="parsePath" value="${escapeHtml(a.parsePath||'')}" style="width:60%"></label><br>
+      <button data-i="${i}" class="del">删除</button>
+    `;
+    container.appendChild(div);
+  });
+
+  const update = (e,p)=>{adapters[e.target.dataset.i][p]=e.target.value;saveAdapters();};
+  container.querySelectorAll('.url').forEach(inp=>inp.onchange=e=>update(e,'urlTemplate'));
+  container.querySelectorAll('.linkTemplate').forEach(inp=>inp.onchange=e=>update(e,'linkTemplate'));
+  container.querySelectorAll('.rateType').forEach(sel=>sel.onchange=e=>update(e,'rateType'));
+  container.querySelectorAll('.parseType').forEach(sel=>sel.onchange=e=>update(e,'parseType'));
+  container.querySelectorAll('.parsePath').forEach(inp=>inp.onchange=e=>update(e,'parsePath'));
+  container.querySelectorAll('.del').forEach(btn=>btn.onclick=e=>{adapters.splice(e.target.dataset.i,1);saveAdapters();renderAdapters();});
+}
+
+document.getElementById('addAdapter').onclick = () => {
+  adapters.push({ name:'新交易所', urlTemplate:'https://api.example.com/quote?from={{from}}&to={{to}}', method:'GET', parseType:'json', parsePath:'data.rate', linkTemplate:'https://example.com/swap?from={{from}}&to={{to}}', rateType:'floating' });
+  saveAdapters(); renderAdapters();
+};
+document.getElementById('loadExample').onclick = () => {
+  adapters = [{
+    name:'示例浮动API',urlTemplate:'https://api.example.com/float?from={{from}}&to={{to}}',parseType:'json',parsePath:'data.floatRate',linkTemplate:'https://example.com/float/{{from}}-{{to}}',rateType:'floating'
+  }];
+  saveAdapters(); renderAdapters();
+};
+document.getElementById('compare').onclick = async ()=>{
+  const from=document.getElementById('from').value.trim().toUpperCase();
+  const to=document.getElementById('to').value.trim().toUpperCase();
+  if(!from||!to)return alert('请输入币种');
+  if(!WORKER_URL.includes('https'))return alert('请在顶部设置正确的 Worker 地址');
+  document.getElementById('status').textContent='查询中...';
+  document.querySelector('#floatingTable tbody').innerHTML='';
+  document.querySelector('#lockedTable tbody').innerHTML='';
+  try{
+    const res=await fetch(WORKER_URL,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({pair:{from,to},adapters})});
+    const results=await res.json();
+    showResults(results);
+    document.getElementById('status').textContent=`查询完成，共 ${results.length} 条结果`;
+  }catch(e){document.getElementById('status').textContent='失败: '+e.message;}
+};
+function showResults(results){
+  const floating=results.filter(r=>r.rateType==='floating');
+  const locked=results.filter(r=>r.rateType==='locked');
+  const sortFn=(a,b)=>{
+    if(a.rate===null&&b.rate===null)return 0;
+    if(a.rate===null)return 1;if(b.rate===null)return -1;return b.rate-a.rate;
+  };
+  floating.sort(sortFn);locked.sort(sortFn);
+  renderTable(floating,'#floatingTable tbody');
+  renderTable(locked,'#lockedTable tbody');
+}
+function renderTable(data,selector){
+  const tbody=document.querySelector(selector);tbody.innerHTML='';
+  if(!data.length){tbody.innerHTML='<tr><td colspan=3 style="text-align:center;color:#666;">无数据</td></tr>';return;}
+  data.forEach((r,i)=>{
+    const tr=document.createElement('tr');
+    const best=i===0&&r.ok&&r.rate!=null;
+    tr.innerHTML=`
+      <td>${r.name}</td>
+      <td>${r.ok&&r.rate!=null?(best?'👑 <b style="color:red;">'+r.rate+'</b>':r.rate):'<span class="err">'+(r.error||'无')+'</span>'}</td>
+      <td>${r.ok&&r.link?'<a href="'+r.link+'" target="_blank">前往</a>':'-'}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+renderAdapters();
+</script>
+</body>
+</html>
