@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>即时兑换汇率对比（多链版）</title>
+<style>
+  body { font-family: -apple-system, "Helvetica Neue", Arial; margin: 12px; }
+  input, button, select { font-size: 15px; padding: 4px; border-radius: 4px; border: 1px solid #ccc; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  th, td { border-bottom: 1px solid #ddd; padding: 8px; text-align:left; }
+  .ok { color: green; } .err { color: #c00; }
+  .small { font-size: 13px; color: #666; }
+  .adapter-item { border: 1px solid #eee; padding: 8px; margin: 6px 0; border-radius: 4px; background: #f9f9f9; }
+  .section-title { margin-top: 20px; border-bottom: 2px solid #555; padding-bottom: 5px; }
+  .config-area { border:1px solid #aaa;padding:8px;margin-top:16px;background:#f5f5f5;border-radius:4px; }
+</style>
+</head>
+<body>
+<h2>🪙 即时兑换汇率对比（多链版）</h2>
+
+<div>
+  <label>币种From:<input id="from" value="BTC" style="width:80px"></label>
+  <label>链From:<input id="fromNetwork" value="ETH" style="width:80px"></label>
+  <label>币种To:<input id="to" value="USDT" style="width:80px"></label>
+  <label>链To:<input id="toNetwork" value="SOL" style="width:80px"></label>
+  <button id="compare">一键比价</button>
+</div>
+
+<div id="status" class="small" style="margin:10px 0;">尚未查询</div>
+
+<h4 style="color:#007bff;">浮动汇率</h4>
+<table id="floatingTable"><thead><tr><th>交易所</th><th>汇率</th><th>操作</th></tr></thead><tbody></tbody></table>
+
+<h4 style="color:#28a745;">锁定汇率</h4>
+<table id="lockedTable"><thead><tr><th>交易所</th><th>汇率</th><th>操作</th></tr></thead><tbody></tbody></table>
+
+<div class="config-area">
+  <h3 class="section-title">🔧 交易所适配器管理（需密码）</h3>
+  <div>
+    <input id="adminPass" type="password" placeholder="输入管理密码" style="width:140px;">
+    <button id="loadFromKV">从后端加载配置</button>
+    <button id="saveToKV">保存到后端</button>
+    <button id="addAdapter">新增交易所</button>
+  </div>
+  <div class="small">可添加或删除自定义交易所 API。配置将保存到 Cloudflare Worker KV 中。</div>
+  <div id="adapterList"></div>
+</div>
+
+<script>
+// ⚠️ 请将此处替换为您实际部署的 Cloudflare Worker URL
+const WORKER_URL = 'https://young-pine-f36b.yanfei6868.workers.dev'; 
+let adapters = [];
+
+// 增强 HTML 实体转义，修复 XSS 风险
+function escapeHtml(s){ 
+  return s ? s.replace(/&/g, '&amp;')
+             .replace(/"/g,'&quot;')
+             .replace(/</g,'&lt;')
+             .replace(/>/g,'&gt;')
+             .replace(/'/g, '&#39;') 
+           : ''; 
+}
+
+function renderAdapters() {
+  const container = document.getElementById('adapterList');
+  container.innerHTML = '';
+  adapters.forEach((a, i) => {
+    const div = document.createElement('div');
+    div.className = 'adapter-item';
+    // 确保所有显示的值都经过转义
+    div.innerHTML = `
+      <b>${escapeHtml(a.name || ('适配器 ' + (i+1)))}</b><br>
+      <div class="small">URL模板: <input data-i="${i}" class="url" value="${escapeHtml(a.urlTemplate||'')}" style="width:90%"></div>
+      <div class="small">链接模板: <input data-i="${i}" class="linkTemplate" value="${escapeHtml(a.linkTemplate||'')}" style="width:90%"></div>
+      <div class="small">
+        <label>类型:
+          <select data-i="${i}" class="rateType">
+            <option value="floating" ${a.rateType==='floating'?'selected':''}>浮动</option>
+            <option value="locked" ${a.rateType==='locked'?'selected':''}>锁定</option>
+          </select>
+        </label>
+      </div>
+      <label>解析类型:
+        <select data-i="${i}" class="parseType">
+          <option value="json" ${a.parseType==='json'?'selected':''}>json</option>
+          <option value="html_regex" ${a.parseType==='html_regex'?'selected':''}>html_regex</option>
+        </select>
+      </label>
+      <label>路径/Regex: <input data-i="${i}" class="parsePath" value="${escapeHtml(a.parsePath||'')}" style="width:60%"></label><br>
+      <button data-i="${i}" class="del">删除</button>
+    `;
+    container.appendChild(div);
+  });
+
+  const update = (e,p)=>{adapters[Number(e.target.dataset.i)][p]=e.target.value;};
+  container.querySelectorAll('.url').forEach(inp=>inp.onchange=e=>update(e,'urlTemplate'));
+  container.querySelectorAll('.linkTemplate').forEach(inp=>inp.onchange=e=>update(e,'linkTemplate'));
+  container.querySelectorAll('.rateType').forEach(sel=>sel.onchange=e=>update(e,'rateType'));
+  container.querySelectorAll('.parseType').forEach(sel=>sel.onchange=e=>update(e,'parseType'));
+  container.querySelectorAll('.parsePath').forEach(inp=>inp.onchange=e=>update(e,'parsePath'));
+  // 显式转为数字索引
+  container.querySelectorAll('.del').forEach(btn=>btn.onclick=e=>{adapters.splice(Number(e.target.dataset.i),1);renderAdapters();});
+}
+
+document.getElementById('addAdapter').onclick = () => {
+  // 补充链占位符
+  adapters.push({ name:'新交易所', urlTemplate:'https://api.example.com?from={{from}}&to={{to}}&fromChain={{fromNetwork}}&toChain={{toNetwork}}', method:'GET', parseType:'json', parsePath:'data.rate', linkTemplate:'https://example.com/{{from}}-{{to}}/{{fromNetwork}}-{{toNetwork}}', rateType:'floating' });
+  renderAdapters();
+};
+
+document.getElementById('loadFromKV').onclick = async () => {
+  try {
+    const res = await fetch(`${WORKER_URL}/getConfig`);
+    if (!res.ok) throw new Error(`HTTP 错误: ${res.status}`);
+    const data = await res.json();
+    adapters = data.adapters || [];
+    alert('✅ 已从后端加载配置，共 '+adapters.length+' 条');
+    renderAdapters();
+  } catch (e) {
+    alert('❌ 从后端加载配置失败: '+e.message);
+  }
+};
+
+document.getElementById('saveToKV').onclick = async () => {
+  const pass = document.getElementById('adminPass').value.trim();
+  if (!pass) return alert('请输入密码');
+  try {
+    const res = await fetch(`${WORKER_URL}/saveConfig`, {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ password: pass, config:{ adapters } })
+    });
+    const data = await res.json();
+    if (data.ok) alert('✅ 配置已保存到后端 KV');
+    else alert('❌ 保存失败: '+(data.error||'未知错误'));
+  } catch (e) {
+     alert('❌ 保存失败: '+e.message);
+  }
+};
+
+// =================== 汇率查询 ===================
+document.getElementById('compare').onclick = async ()=>{
+  const from=document.getElementById('from').value.trim().toUpperCase();
+  const to=document.getElementById('to').value.trim().toUpperCase();
+  const fromNetwork=document.getElementById('fromNetwork').value.trim().toUpperCase();
+  const toNetwork=document.getElementById('toNetwork').value.trim().toUpperCase();
+  if(!from||!to)return alert('请输入币种');
+  document.getElementById('status').textContent='查询中...';
+  document.querySelector('#floatingTable tbody').innerHTML='';
+  document.querySelector('#lockedTable tbody').innerHTML='';
+  try{
+    const res=await fetch(WORKER_URL, {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ pair:{ from, to, fromNetwork, toNetwork }, adapters })
+    });
+    if (!res.ok) throw new Error(`HTTP 错误: ${res.status}`);
+    const results=await res.json();
+    showResults(results);
+    document.getElementById('status').textContent=`✅ 查询完成，共 ${results.length} 条结果`;
+  }catch(e){
+    document.getElementById('status').textContent='❌ 失败: '+e.message;
+  }
+};
+
+function showResults(results){
+  const floating=results.filter(r=>r.rateType==='floating');
+  const locked=results.filter(r=>r.rateType==='locked');
+  const sortFn=(a,b)=>{
+    if(a.rate===null&&b.rate===null)return 0;
+    if(a.rate===null)return 1;if(b.rate===null)return -1;return b.rate-a.rate;
+  };
+  floating.sort(sortFn);locked.sort(sortFn);
+  renderTable(floating,'#floatingTable tbody');
+  renderTable(locked,'#lockedTable tbody');
+}
+
+function renderTable(data,selector){
+  const tbody=document.querySelector(selector);tbody.innerHTML='';
+  if(!data.length){tbody.innerHTML='<tr><td colspan=3 style="text-align:center;color:#666;">无数据</td></tr>';return;}
+  data.forEach((r,i)=>{
+    const tr=document.createElement('tr');
+    const best=i===0&&r.ok&&r.rate!=null;
+    // 修复 XSS 风险：对 name 和 link 进行转义
+    const safeName = escapeHtml(r.name);
+    const safeLink = escapeHtml(r.link || '');
+    tr.innerHTML=`
+      <td>${safeName}</td>
+      <td>${r.ok&&r.rate!=null?(best?'👑 <b style="color:red;">'+r.rate+'</b>':r.rate):'<span class="err">'+escapeHtml(r.error||'无')+'</span>'}</td>
+      <td>${r.ok&&r.link?'<a href="'+safeLink+'" target="_blank">前往</a>':'-'}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+</script>
+</body>
+</html>
