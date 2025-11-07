@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>即时兑换汇率对比（多链版）</title>
+<style>
+  body { font-family: -apple-system, "Helvetica Neue", Arial; margin: 12px; }
+  input, button, select { font-size: 15px; padding: 4px; border-radius: 4px; border: 1px solid #ccc; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  th, td { border-bottom: 1px solid #ddd; padding: 8px; text-align:left; }
+  .ok { color: green; } .err { color: #c00; }
+  .small { font-size: 13px; color: #666; }
+  .adapter-item { border: 1px solid #eee; padding: 8px; margin: 6px 0; border-radius: 4px; background: #f9f9f9; }
+  .section-title { margin-top: 20px; border-bottom: 2px solid #555; padding-bottom: 5px; }
+  .config-area { border:1px solid #aaa;padding:8px;margin-top:16px;background:#f5f5f5;border-radius:4px; }
+  .summary { margin-top: 15px; padding: 10px; border: 1px solid #eee; border-radius: 4px; background: #f0f8ff; }
+  .summary b { font-size: 1.1em; }
+  .best-mark { color: green; font-weight: bold; margin-left: 4px; }
+</style>
+</head>
+<body>
+<h2>即时兑换汇率对比（多链版）</h2>
+
+<div>
+  <label>币种From:<input id="from" value="BTC" style="width:80px"></label>
+  <label>链From:<input id="fromNetwork" value="ETH" style="width:80px"></label>
+  <label>币种To:<input id="to" value="USDT" style="width:80px"></label>
+  <label>链To:<input id="toNetwork" value="SOL" style="width:80px"></label>
+  <label>数量:<input id="amount" value="1" style="width:80px"></label>
+  <button id="compare">一键比价</button>
+  <button id="copyJson" style="margin-left:8px; display:none;">复制 JSON</button>
+</div>
+
+<div id="status" class="small" style="margin:10px 0;">尚未查询</div>
+
+<h4 style="color:#007bff;">浮动汇率</h4>
+<table id="floatingTable"><thead><tr><th>交易所</th><th>汇率</th><th>预估输出量</th><th>操作</th></tr></thead><tbody></tbody></table>
+
+<div id="floatingSummary" class="summary" style="display:none;"></div>
+
+<h4 style="color:#28a745;">锁定汇率</h4>
+<table id="lockedTable"><thead><tr><th>交易所</th><th>汇率</th><th>预估输出量</th><th>操作</th></tr></thead><tbody></tbody></table>
+
+<div id="lockedSummary" class="summary" style="display:none;"></div>
+
+<div class="config-area">
+  <h3 class="section-title">交易所适配器管理（需密码）</h3>
+  <div>
+    <input id="adminPass" type="password" placeholder="输入管理密码" style="width:140px;">
+    <button id="loadFromKV">从后端加载配置</button>
+    <button id="saveToKV">保存到后端</button>
+    <button id="addAdapter">新增交易所</button>
+  </div>
+  <div class="small">可添加或删除自定义交易所 API。配置将保存到 Cloudflare Worker KV 中。</div>
+  <div id="adapterList"></div>
+</div>
+
+<h2>配置管理</h2>
+<div id="admin-panel">
+  <input id="admin-pass" placeholder="管理密码" type="password" style="width:140px;" />
+  <input id="api-key" placeholder="ChangeNOW API Key" style="width:200px;" />
+  <button onclick="saveConfig()">保存配置</button>
+</div>
+
+<script>
+// 请确保此处的 WORKER_URL 正确指向您的 Cloudflare Worker
+const WORKER_URL = 'YOUR_WORKER_URL_HERE'; 
+let adapters = [];
+let queryPair = {}; 
+let lastResults = null;
+
+function escapeHtml(s){ 
+  return s ? s.replace(/&/g, '&amp;')
+             .replace(/"/g,'&quot;')
+             .replace(/</g,'&lt;')
+             .replace(/>/g,'&gt;')
+             .replace(/'/g, '&#39;') 
+           : ''; 
+}
+
+function renderAdapters() {
+  const container = document.getElementById('adapterList');
+  container.innerHTML = '';
+  adapters.forEach((a, i) => {
+    const mappingsJson = JSON.stringify(a.mappings || {}, null, 2);
+    const headersJson = JSON.stringify(a.headers || {}, null, 2); // 🔹 第1处：新增 headers 序列化
+
+    const div = document.createElement('div');
+    div.className = 'adapter-item';
+    div.innerHTML = `
+      <b>${escapeHtml(a.name || ('适配器 ' + (i+1)))}</b><br>
+      <div class="small">URL模板: <input data-i="<LaTex>${i}" class="url" value="$</LaTex>{escapeHtml(a.urlTemplate||'')}" style="width:90%"></div>
+      <div class="small">链接模板: <input data-i="<LaTex>${i}" class="linkTemplate" value="$</LaTex>{escapeHtml(a.linkTemplate||'')}" style="width:90%"></div>
+      <div class="small">
+        <label>类型:
+          <select data-i="${i}" class="rateType">
+            <option value="floating" ${a.rateType==='floating'?'selected':''}>浮动</option>
+            <option value="locked" ${a.rateType==='locked'?'selected':''}>锁定</option>
+          </select>
+        </label>
+      </div>
+      <label>解析类型:
+        <select data-i="${i}" class="parseType">
+          <option value="json" ${a.parseType==='json'?'selected':''}>json</option>
+          <option value="html_regex" ${a.parseType==='html_regex'?'selected':''}>html_regex</option>
+        </select>
+      </label>
+      <label>路径/Regex: <input data-i="<LaTex>${i}" class="parsePath" value="$</LaTex>{escapeHtml(a.parsePath||'')}" style="width:60%"></label><br>
+      <div class="small">
+        <label>币种/链名映射 (Mappings): <textarea data-i="${i}" class="mappings" style="width:90%; height: 80px;" placeholder='{"BTC": "XBT", "ETH": "ETHEREUM"}'></textarea></label>
+      </div>
+      <div class="small">
+        <label>API Key: <input data-i="<LaTex>${i}" class="apiKey" value="$</LaTex>{escapeHtml(a.apiKey||'')}" style="width:90%"></label>
+      </div>
+      <!-- 🔹 第1处：新增自定义 Headers 输入框 -->
+      <div class="small">
+        <label>自定义 Headers(JSON):
+          <textarea data-i="${i}" class="headers" style="width:90%; height:70px;"
+            placeholder='{"x-changenow-api-key":"{{apiKey}}"}'></textarea>
+        </label>
+      </div>
+      <button data-i="${i}" class="del">删除</button>
+    `;
+    div.querySelector('.mappings').value = mappingsJson;
+    div.querySelector('.headers').value = headersJson; // 🔹 第1处：赋值 headers
+    container.appendChild(div);
+  });
+
+  const update = (e,p)=>{
+    const i = Number(e.target.dataset.i);
+    // 🔹 第2处：支持解析 headers 字段
+    if (p === 'mappings' || p === 'headers') {
+      try {
+        adapters[i][p] = JSON.parse(e.target.value || '{}');
+      } catch(err) {
+        alert('配置格式错误，必须是有效的 JSON 对象: ' + err.message);
+        return;
+      }
+    } else {
+      adapters[i][p] = e.target.value;
+    }
+  };
+  
+  container.querySelectorAll('.url').forEach(inp=>inp.onchange=e=>update(e,'urlTemplate'));
+  container.querySelectorAll('.linkTemplate').forEach(inp=>inp.onchange=e=>update(e,'linkTemplate'));
+  container.querySelectorAll('.rateType').forEach(sel=>sel.onchange=e=>update(e,'rateType'));
+  container.querySelectorAll('.parseType').forEach(sel=>sel.onchange=e=>update(e,'parseType'));
+  container.querySelectorAll('.parsePath').forEach(inp=>inp.onchange=e=>update(e,'parsePath'));
+  container.querySelectorAll('.mappings').forEach(ta=>ta.onchange=e=>update(e,'mappings'));
+  container.querySelectorAll('.apiKey').forEach(inp=>inp.onchange=e=>update(e,'apiKey'));
+  container.querySelectorAll('.headers').forEach(ta=>ta.onchange=e=>update(e,'headers')); // 🔹 第2处：监听 headers 变化
+  container.querySelectorAll('.del').forEach(btn=>btn.onclick=e=>{adapters.splice(Number(e.target.dataset.i),1);renderAdapters();});
+}
+
+document.getElementById('addAdapter').onclick = () => {
+  adapters.push({ 
+    name:'新交易所', 
+    urlTemplate:'https://api.example.com?from={{from}}&to={{to}}&fromChain={{fromNetwork}}&toChain={{toNetwork}}', 
+    method:'GET', 
+    parseType:'json', 
+    parsePath:'data.rate', 
+    linkTemplate:'https://example.com/{{from}}-{{to}}/{{fromNetwork}}-{{toNetwork}}', 
+    rateType:'floating',
+    mappings: {},
+    apiKey: '',
+    headers: {} // 🔹 第3处：初始化 headers 字段
+  });
+  renderAdapters();
+};
+
+function disableAdminIfNoWorker() {
+  const disabled = !WORKER_URL || WORKER_URL === 'YOUR_WORKER_URL_HERE';
+  const loadBtn = document.getElementById('loadFromKV');
+  const saveBtn = document.getElementById('saveToKV');
+  const compareBtn = document.getElementById('compare');
+  loadBtn.disabled = disabled;
+  saveBtn.disabled = disabled;
+  compareBtn.disabled = disabled;
+  if (disabled) {
+    document.getElementById('status').textContent = '请先设置 WORKER_URL（当前为占位符），以启用请求功能';
+  } else {
+    document.getElementById('status').textContent = 'Worker 正常运行。';
+  }
+}
+disableAdminIfNoWorker();
+
+document.getElementById('loadFromKV').onclick = async () => {
+  const pass = document.getElementById('adminPass').value.trim();
+  if (!pass) return alert('请输入管理密码');
+  try {
+    const res = await fetch(WORKER_URL + '/getConfig', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pass })
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(txt || ('HTTP ' + res.status));
+    }
+    const json = await res.json();
+    adapters = json.adapters || [];
+    
+    // **前端修改点 1: 同步填充 API Key**
+    if (json.CHANGENOW_API_KEY) {
+      document.getElementById('api-key').value = json.CHANGENOW_API_KEY;
+    }
+    
+    alert('已从后端加载配置');
+    renderAdapters();
+  } catch (err) {
+    alert('加载失败：' + err.message);
+  } finally {
+    try { document.getElementById('adminPass').value = ''; } catch(e){}
+  }
+};
+
+document.getElementById('saveToKV').onclick = async () => {
+  const pass = document.getElementById('adminPass').value.trim();
+  if (!pass) return alert('请输入管理密码');
+  try {
+    const res = await fetch(WORKER_URL + '/saveConfig', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      // **适配器保存时只传 adapters，让后端合并**
+      body: JSON.stringify({ pass, adapters }) 
+    });
+    const txt = await res.text();
+    if (!res.ok) throw new Error(txt || ('HTTP ' + res.status));
+    alert(txt);
+  } catch (err) {
+    alert('保存失败：' + err.message);
+  } finally {
+    try { document.getElementById('adminPass').value = ''; } catch(e){}
+  }
+};
+
+document.getElementById('compare').onclick = async ()=>{
+  const from=document.getElementById('from').value.trim().toUpperCase();
+  const to=document.getElementById('to').value.trim().toUpperCase();
+  const fromNetwork=document.getElementById('fromNetwork').value.trim().toUpperCase();
+  const toNetwork=document.getElementById('toNetwork').value.trim().toUpperCase();
+  const amountRaw = document.getElementById('amount').value.trim();
+  const amount = Number(amountRaw);
+  if(!from||!to)return alert('请输入币种');
+  if (isNaN(amount) || amount <= 0 || amount > 10000) return alert('请输入有效数量 (大于 0 且不超过 10000)');
+
+  queryPair = { from, to, fromNetwork, toNetwork, amount }; 
+
+  document.getElementById('status').textContent='查询中...';
+  document.querySelector('#floatingTable tbody').innerHTML='';
+  document.querySelector('#lockedTable tbody').innerHTML='';
+  document.getElementById('floatingSummary').style.display='none';
+  document.getElementById('lockedSummary').style.display='none';
+  document.getElementById('copyJson').style.display='none';
+
+  const controller = new AbortController();
+  const timeout = setTimeout(()=>controller.abort(), 12000);
+
+  try{
+    const res=await fetch(WORKER_URL, {
+      method:'POST', headers:{'content-type':'application/json'}, signal: controller.signal,
+      body: JSON.stringify({ pair: queryPair, adapters })
+    });
+    if (!res.ok) throw new Error(`HTTP 错误: ${res.status}`);
+    const results=await res.json();
+    lastResults = results;
+    showResults(results);
+    document.getElementById('status').textContent=`查询完成，共 ${results.results.length} 条结果`;
+    document.getElementById('copyJson').style.display='inline-block';
+  }catch(e){
+    if (e.name === 'AbortError') {
+      document.getElementById('status').textContent='失败: 请求超时';
+    } else {
+      document.getElementById('status').textContent='失败: '+e.message;
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+document.getElementById('copyJson').onclick = () => {
+  if (!lastResults) return alert('无结果可复制');
+  navigator.clipboard.writeText(JSON.stringify(lastResults, null, 2)).then(() => {
+    alert('已复制 JSON 到剪贴板');
+  }).catch(() => {
+    alert('复制失败');
+  });
+};
+
+async function saveConfig() {
+  const adminPass = document.getElementById('admin-pass').value;
+  const apiKey = document.getElementById('api-key').value;
+
+  const res = await fetch(`${WORKER_URL}/saveConfig`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    // **修复点 2: 修正密码字段名为 password**
+    body: JSON.stringify({
+      password: adminPass,
+      config: { CHANGENOW_API_KEY: apiKey }
+    })
+  });
+
+  const data = await res.text();
+  alert(data);
+}
+
+function showResults(results){
+  const floating = results.results.filter(r=>r.rateType==='floating');
+  const locked = results.results.filter(r=>r.rateType==='locked');
+  
+  const sortFn=(a,b)=>{
+    const ao = (a && a.outputAmount != null) ? a.outputAmount : -Infinity;
+    const bo = (b && b.outputAmount != null) ? b.outputAmount : -Infinity;
+    if (ao === -Infinity && bo === -Infinity) return 0;
+    if (ao === -Infinity) return 1;
+    if (bo === -Infinity) return -1;
+    return bo - ao;
+  };
+  
+  floating.sort(sortFn);
+  locked.sort(sortFn);
+  
+  renderTable(floating,'#floatingTable tbody');
+  renderTable(locked,'#lockedTable tbody');
+  
+  renderSummary(floating.filter(r => r.ok && r.rate != null), '#floatingSummary', floating[0], results.stats?.floating);
+  renderSummary(locked.filter(r => r.ok && r.rate != null), '#lockedSummary', locked[0], results.stats?.locked);
+}
+
+function renderTable(data,selector){
+  const tbody=document.querySelector(selector);tbody.innerHTML='';
+  if(!data.length){tbody.innerHTML='<tr><td colspan=4 style="text-align:center;color:#666;">无数据</td></tr>';return;}
+  data.forEach((r,i)=>{
+    // **修复点 3: 修正 best 标记逻辑**
+    // 检查是否是排序后的第一个元素，并且有有效输出量，且输出量等于第一个元素的输出量（防止平局时标记多个）
+    const best = i===0 && r.ok && r.outputAmount != null && data[0].outputAmount != null && r.outputAmount === data[0].outputAmount; 
+    
+    const outputDisplay = r.ok && r.outputAmount != null 
+                          ? Number(r.outputAmount).toFixed(6) + ' ' + queryPair.to
+                          : '-';
+
+    const tr = document.createElement('tr');
+
+    const tdName = document.createElement('td');
+    tdName.innerHTML = (r.name || '-') + (best ? '<span class="best-mark">Best</span>' : '');
+
+    const tdRate = document.createElement('td');
+    if (r.ok && r.rate != null) {
+      if (best) {
+        const b = document.createElement('b');
+        b.style.color = 'red';
+        b.textContent = String(r.rate);
+        tdRate.appendChild(b);
+      } else {
+        tdRate.textContent = String(r.rate);
+      }
+    } else {
+      const spanErr = document.createElement('span');
+      spanErr.className = 'err';
+      spanErr.textContent = r.error || '无';
+      tdRate.appendChild(spanErr);
+    }
+
+    const tdOutput = document.createElement('td');
+    tdOutput.textContent = outputDisplay;
+
+    const tdOp = document.createElement('td');
+    if (r.ok && r.link && (r.link.startsWith('http://') || r.link.startsWith('https://'))) {
+      let safeHref = '#';
+      try {
+        const u = new URL(r.link);
+        if (u.protocol === 'http:' || u.protocol === 'https:') {
+          safeHref = u.toString();
+        } else {
+          safeHref = '#';
+        }
+      } catch (e) {
+        safeHref = '#';
+      }
+      if (safeHref !== '#') {
+        const a = document.createElement('a');
+        a.href = safeHref;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.textContent = '前往';
+        tdOp.appendChild(a);
+      } else {
+        tdOp.textContent = '-';
+      }
+    } else {
+      tdOp.textContent = '-';
+    }
+
+    tr.appendChild(tdName);
+    tr.appendChild(tdRate);
+    tr.appendChild(tdOutput);
+    tr.appendChild(tdOp);
+    tbody.appendChild(tr);
+  });
+}
+
+function renderSummary(data, selector, bestResult, stats) {
+    const summaryDiv = document.querySelector(selector);
+    
+    if (data.length === 0) {
+        summaryDiv.style.display = 'none';
+        return;
+    }
+    
+    summaryDiv.style.display = 'block';
+    
+    const rates = data.map(r => r.rate);
+    const sumRate = rates.reduce((a, b) => a + b, 0);
+    const avgRate = sumRate / rates.length;
+    
+    const bestRate = bestResult.rate;
+    const bestOutput = bestResult.outputAmount.toFixed(6);
+
+    const fromCoin = queryPair.from;
+    const toCoin = queryPair.to;
+
+    let extra = '';
+    if (stats) {
+      extra = `
+        <p>最低: <b>${stats.min.toFixed(6)}</b> | 最高: <b>${stats.max.toFixed(6)}</b> | 标准差: <b>${stats.stddev.toFixed(6)}</b></p>
+      `;
+    }
+    
+    summaryDiv.innerHTML = `
+        <p>输入量: <b><LaTex>${queryPair.amount} $</LaTex>{fromCoin}-${queryPair.fromNetwork}</b></p>
+        <p>最优汇率 (<LaTex>${bestResult.name}): <b>$</LaTex>{bestRate}</b> 
+           (预估输出: <b><LaTex>${bestOutput} $</LaTex>{toCoin}</b>)</p>
+        <p>平均汇率: <b>${avgRate.toFixed(6)}</b> 
+           (预估输出: <b><LaTex>${(avgRate * queryPair.amount).toFixed(6)} $</LaTex>{toCoin}</b>)</p>
+        ${extra}
+    `;
+}
+</script>
+</body>
+</html>
