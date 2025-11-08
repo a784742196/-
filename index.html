@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>即时兑换汇率对比（多链版）</title>
+<style>
+  body { font-family: -apple-system, "Helvetica Neue", Arial; margin: 12px; }
+  input, button, select, textarea { font-size: 15px; padding: 4px; border-radius: 4px; border: 1px solid #ccc; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  th, td { border-bottom: 1px solid #ddd; padding: 8px; text-align:left; }
+  .ok { color: green; } .err { color: #c00; }
+  .small { font-size: 13px; color: #666; }
+  .adapter-item { border: 1px solid #eee; padding: 8px; margin: 6px 0; border-radius: 4px; background: #f9f9f9; }
+  .section-title { margin-top: 20px; border-bottom: 2px solid #555; padding-bottom: 5px; }
+  .config-area { border:1px solid #aaa;padding:8px;margin-top:16px;background:#f5f5f5;border-radius:4px; }
+  .summary { margin-top: 15px; padding: 10px; border: 1px solid #eee; border-radius: 4px; background: #f0f8ff; }
+  .summary b { font-size: 1.1em; }
+  .best-mark { color: green; font-weight: bold; margin-left: 4px; }
+  .rate-mode-switch { margin: 10px 0; }
+  .rate-mode-switch button { margin-right: 8px; padding: 6px 12px; }
+  .rate-mode-switch button.active { background: #007bff; color: white; }
+</style>
+</head>
+<body>
+<h2>即时兑换汇率对比（多链版）</h2>
+
+<div>
+  <label>币种From:<input id="from" value="BTC" style="width:80px"></label>
+  <label>链From:<input id="fromNetwork" value="BTC" style="width:80px"></label>
+  <label>币种To:<input id="to" value="USDT" style="width:80px"></label>
+  <label>链To:<input id="toNetwork" value="ETH" style="width:80px"></label>
+  <label>数量:<input id="amount" value="1" style="width:80px"></label>
+  <div class="rate-mode-switch">
+    <button data-mode="floating" class="active">浮动汇率</button>
+    <button data-mode="locked">锁定汇率</button>
+  </div>
+  <button id="compare">一键比价</button>
+  <button id="copyJson" style="margin-left:8px; display:none;">复制 JSON</button>
+</div>
+
+<div id="status" class="small" style="margin:10px 0;">请设置 WORKER_URL</div>
+
+<h4 style="color:#007bff;">浮动汇率</h4>
+<table id="floatingTable"><thead><tr><th>交易所</th><th>汇率</th><th>预估输出量</th><th>操作</th></tr></thead><tbody></tbody></table>
+<div id="floatingSummary" class="summary" style="display:none;"></div>
+
+<h4 style="color:#28a745;">锁定汇率</h4>
+<table id="lockedTable"><thead><tr><th>交易所</th><th>汇率</th><th>预估输出量</th><th>操作</th></tr></thead><tbody></tbody></table>
+<div id="lockedSummary" class="summary" style="display:none;"></div>
+
+<div class="config-area">
+  <h3 class="section-title">交易所适配器管理（需密码）</h3>
+  <div>
+    <input id="adminPass" type="password" placeholder="输入管理密码" style="width:140px;">
+    <button id="loadFromKV">从后端加载配置</button>
+    <button id="saveToKV">保存到后端</button>
+    <button id="addAdapter">新增交易所</button>
+  </div>
+  <div class="small">可添加或删除自定义交易所 API。配置将保存到 Cloudflare Worker KV 中。</div>
+  <div id="adapterList"></div>
+</div>
+
+<h2>全局配置管理</h2>
+<div id="admin-panel" class="config-area">
+  <input id="admin-pass" placeholder="管理密码" type="password" style="width:140px;" />
+  <input id="api-key" placeholder="ChangeNOW API Key" style="width:240px;" />
+  <button onclick="saveConfig()">保存全局配置</button>
+</div>
+
+<script>
+// ==================== 请在此处修改你的 Worker 地址 ====================
+const WORKER_URL = 'https://winter-rice-b000.yanfei6868.workers.dev'; 
+// ==================================================================
+
+let adapters = [];
+let queryPair = {}; 
+let lastResults = null;
+let currentRateMode = 'floating';
+
+function escapeHtml(s) {
+  if (!s) return '';
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/'/g, '&#39;');
+}
+
+function renderAdapters() {
+  const container = document.getElementById('adapterList');
+  container.innerHTML = '';
+  adapters.forEach((a, i) => {
+    const mappingsJson = JSON.stringify(a.mappings || {}, null, 2);
+    const headersJson = JSON.stringify(a.headers || {}, null, 2);
+
+    const div = document.createElement('div');
+    div.className = 'adapter-item';
+    div.innerHTML = `
+      <input data-i="${i}" class="adapter-name" value="${escapeHtml(a.name || '新交易所')}" style="font-weight:bold;width:180px;">
+      <button data-i="${i}" class="del" style="float:right;">删除</button><br>
+      <div class="small">URL模板: 
+        <input data-i="${i}" class="url" value="${escapeHtml(a.urlTemplate||'')}">
+      </div>
+      <div class="small">链接模板: 
+        <input data-i="${i}" class="linkTemplate" value="${escapeHtml(a.linkTemplate||'')}">
+      </div>
+      <div class="small">
+        <label>类型:
+          <select data-i="${i}" class="rateType">
+            <option value="floating" ${a.rateType==='floating'?'selected':''}>浮动</option>
+            <option value="locked" ${a.rateType==='locked'?'selected':''}>锁定</option>
+          </select>
+        </label>
+      </div>
+      <label>解析类型:
+        <select data-i="${i}" class="parseType">
+          <option value="json" ${a.parseType==='json'?'selected':''}>json</option>
+          <option value="html_regex" ${a.parseType==='html_regex'?'selected':''}>html_regex</option>
+        </select>
+      </label>
+      <label>路径/Regex: 
+        <input data-i="${i}" class="parsePath" value="${escapeHtml(a.parsePath||'')}">
+      </label><br>
+      <div class="small">
+        <label>币种/链名映射 (Mappings): 
+          <textarea data-i="${i}" class="mappings" style="width:90%; height: 80px;">${escapeHtml(mappingsJson)}</textarea>
+        </label>
+      </div>
+      <div class="small">
+        <label>API Key: 
+          <input data-i="${i}" class="apiKey" value="${escapeHtml(a.apiKey||'')}">
+        </label>
+      </div>
+      <div class="small">
+        <label>自定义 Headers(JSON):
+          <textarea data-i="${i}" class="headers" style="width:90%; height:70px;">${escapeHtml(headersJson)}</textarea>
+        </label>
+      </div>
+    `;
+    container.appendChild(div);
+  });
+}
+
+// ===================== 🔧 compare 按钮修正版 =====================
+document.getElementById('compare').onclick = async () => {
+  const from = document.getElementById('from').value.trim().toUpperCase();
+  const to = document.getElementById('to').value.trim().toUpperCase();
+  const fromNetwork = document.getElementById('fromNetwork').value.trim().toUpperCase();
+  const toNetwork = document.getElementById('toNetwork').value.trim().toUpperCase();
+  const amount = Number(document.getElementById('amount').value.trim());
+  if (!from || !to) return alert('请输入币种');
+  if (isNaN(amount) || amount <= 0 || amount > 10000) return alert('数量必须在 0~10000 之间');
+
+  queryPair = { from, to, fromNetwork, toNetwork, amount };
+  document.getElementById('status').textContent = '查询中...';
+  ['#floatingTable tbody', '#lockedTable tbody'].forEach(s => document.querySelector(s).innerHTML = '');
+  ['#floatingSummary', '#lockedSummary'].forEach(s => document.querySelector(s).style.display = 'none');
+  document.getElementById('copyJson').style.display = 'none';
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const res = await fetch(WORKER_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({ pair: queryPair, adapters, rateMode: currentRateMode })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const results = await res.json(); // ✅ Worker 返回的是数组
+    lastResults = results;
+    showResults(results); // ✅ 直接传入数组
+    document.getElementById('status').textContent = `完成，共 ${results.length} 条`; // ✅ 改为 results.length
+    document.getElementById('copyJson').style.display = 'inline-block';
+  } catch (e) {
+    document.getElementById('status').textContent = e.name === 'AbortError' ? '请求超时' : '错误: ' + e.message;
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+// ===================== 🔧 showResults 修正版 =====================
+function showResults(results) {
+  // ✅ 现在 results 已经是数组，不再访问 results.results
+  const data = results.filter(r => r.rateType === currentRateMode);
+  
+  const sortFn = (a, b) => {
+    if (a.ok !== b.ok) return a.ok ? -1 : 1;
+    const precisionA = a.outputAmount ? (a.outputAmount + '').split('.')[1]?.length || 0 : 0;
+    const precisionB = b.outputAmount ? (b.outputAmount + '').split('.')[1]?.length || 0 : 0;
+    if (precisionA !== precisionB) return precisionB - precisionA;
+    if (a.rate !== b.rate) return (b.rate || 0) - (a.rate || 0);
+    if (a.responseTime && b.responseTime) return a.responseTime - b.responseTime;
+    return 0;
+  };
+  
+  data.sort(sortFn);
+  
+  const tableId = currentRateMode === 'floating' ? '#floatingTable tbody' : '#lockedTable tbody';
+  const summaryId = currentRateMode === 'floating' ? '#floatingSummary' : '#lockedSummary';
+  
+  renderTable(data, tableId);
+  renderSummary(data.filter(r => r.ok && r.rate != null), summaryId, data[0], null);
+}
+
+// 其余辅助函数保持不变
+</script>
+</body>
+</html>
